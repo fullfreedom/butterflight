@@ -246,8 +246,10 @@ void pidInitFilters(const pidProfile_t *pidProfile)
 
 static FAST_RAM float Kp[3], Ki[3], Kd[3];
 static FAST_RAM float maxVelocity[3];
+#ifndef BUTTER_PIDS
 static FAST_RAM float relaxFactor;
 static FAST_RAM float dtermSetpointWeight;
+#endif
 static FAST_RAM float levelGain, horizonGain, horizonTransition, horizonCutoffDegrees, horizonFactorRatio;
 static FAST_RAM float ITermWindupPointInv;
 static FAST_RAM uint8_t horizonTiltExpertMode;
@@ -268,8 +270,10 @@ void pidInitConfig(const pidProfile_t *pidProfile)
         Ki[axis] = ITERM_SCALE * pidProfile->pid[axis].I;
         Kd[axis] = DTERM_SCALE * pidProfile->pid[axis].D;
     }
+#ifndef BUTTER_PIDS
     dtermSetpointWeight = pidProfile->dtermSetpointWeight / 127.0f;
     relaxFactor = 1.0f / (pidProfile->setpointRelaxRatio / 100.0f);
+#endif
     levelGain = pidProfile->pid[PID_LEVEL].P / 10.0f;
     horizonGain = pidProfile->pid[PID_LEVEL].I / 10.0f;
     horizonTransition = (float)pidProfile->pid[PID_LEVEL].D;
@@ -409,25 +413,29 @@ void pidController(const pidProfile_t *pidProfile, const rollAndPitchTrims_t *an
     static timeUs_t previousTimeUs;
 
     // calculate actual deltaT in seconds
-    const float deltaT = (currentTimeUs - previousTimeUs) * 0.000001f;
+    const float deltaT = (currentTimeUs - previousTimeUs) * 0.000001f;   
     const float iDT = 1.0f/deltaT; //divide once
-    
-    previousTimeUs = currentTimeUs;
 
+    previousTimeUs = currentTimeUs;    
+
+#ifndef BUTTER_PIDS
     // Dynamic i component,
     // gradually scale back integration when above windup point,
     // use dT (not deltaT) for ITerm calculation to avoid wind-up caused by jitter
     const float dynCi = MIN((1.0f - motorMixRange) * ITermWindupPointInv, 1.0f) * dT * itermAccelerator;
-
-    // Dynamic d component, enable 2-DOF PID controller only for rate mode
     const float dynCd = flightModeFlags ? 0.0f : dtermSetpointWeight;
-    float currentPidSetpoint;
-    float ITermNew;
     float gyroRateFiltered;
     float ornD;    // cr - y
     float setpointT;
+#else 
+    // use deltaT for ITerm calculation to avoid wind-up caused by jitter
+    const float dynCi = MIN(1.0f - motorMixRange * ITermWindupPointInv, 1.0f) * deltaT * itermAccelerator;
+#endif
+
     float dDelta;
     float errorRate;
+    float currentPidSetpoint;
+    float ITermNew;
 
     // ----------PID controller----------
     for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
@@ -479,7 +487,7 @@ void pidController(const pidProfile_t *pidProfile, const rollAndPitchTrims_t *an
                 }
             }
         }
-
+#ifndef BUTTER_PIDS
         // --------low-level gyro-based PID based on 2DOF PID controller. ----------
         // 2-DOF PID controller with optional filter on derivative term.
         // b = 1 and only c (dtermSetpointWeight) can be tuned (amount derivative on measurement or error).
@@ -521,7 +529,22 @@ void pidController(const pidProfile_t *pidProfile, const rollAndPitchTrims_t *an
                 break;
         }
         previousRateError[axis] = ornD;
+#else
+        // -----calculate P component
+        axisPID_P[axis] = (Kp[axis] * errorRate) * tpaFactor;
 
+        // -----calculate I component
+        ITermNew = constrainf(axisPID_I[axis] + (Ki[axis] * errorRate) * dynCi, -itermLimit, itermLimit);
+        if (!mixerIsOutputSaturated(axis, errorRate) || ABS(ITermNew) < ABS(axisPID_I[axis])) {
+            // Only increase ITerm if output is not saturated
+            axisPID_I[axis] = ITermNew;
+        }
+
+        // -----calculate D component
+        // use measurement and apply filters. mmmm gimme that butter.      
+        dDelta = dtermLpfApplyFn(dtermFilterLpf[axis], -((gyro.gyroADCf[axis] - previousRateError[axis]) * iDT));
+        previousRateError[axis] = gyro.gyroADCf[axis];        
+#endif
         // if crash recovery is on and accelerometer enabled and there is no gyro overflow, then check for a crash
         // no point in trying to recover if the crash is so severe that the gyro overflows
         if (pidProfile->crash_recovery && !gyroOverflowDetected()) {
